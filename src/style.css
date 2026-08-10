@@ -57,3 +57,11 @@ html, body {
   letter-spacing: 0.05em;
   pointer-events: none;
 }
+
+#debug {
+  margin-top: 6px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre;
+  opacity: 0.85;
+}

@@ -10,6 +10,7 @@ const overlay = document.getElementById('overlay') as HTMLCanvasElement;
 const overlayCtx = overlay.getContext('2d')!;
 const sceneCanvas = document.getElementById('scene') as HTMLCanvasElement;
 const statusEl = document.getElementById('status')!;
+const debugEl = document.getElementById('debug')!;
 
 const HAND_CONNECTIONS: [number, number][] = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -21,16 +22,56 @@ const HAND_CONNECTIONS: [number, number][] = [
 ];
 
 const MAX_HANDS = 2;
-const HAND_COLORS = [0x66ffff, 0xff66d9];
+const OBJECT_COLORS = [0x66ffff, 0xff66d9, 0x8cff66, 0xffaa33];
 const GRAB_COLOR = 0xffcc33;
+const HOVER_HINT_COLOR = 0xffffff;
 
-// ---------- Three.js hologram setup ----------
+// Pinch is measured as thumb-to-index distance DIVIDED BY palm width, not as a raw
+// absolute distance — a raw threshold only works at one specific distance from the
+// camera, since the same physical pinch produces smaller landmark distances the
+// farther your hand is from the lens. The ratio is roughly distance-invariant.
+const PINCH_ON_RATIO = 0.55; // pinch starts once thumb+index closer than this fraction of palm width
+const PINCH_OFF_RATIO = 0.75; // releases above this fraction (hysteresis avoids flicker at the edge)
+// Two separate radii: claiming a fresh idle object needs to be tight so neighboring
+// grid slots don't overlap (half the grid spacing is ~1.1-1.9 units). Joining an
+// object your OTHER hand already holds can be far more generous — that's checked
+// and preferred first, so bringing your second hand in to combine doesn't
+// accidentally land in an adjacent object's claim zone instead.
+const FREE_GRAB_RADIUS = 1.0; // world units to claim an idle object
+const COMBINE_RADIUS = 2.5; // world units to join an object your other hand holds
+const AMBIENT_SPIN = 0.15; // rad/s idle rotation when nothing holds the object
+const LINEAR_DAMPING = 2.2; // higher = fling stops sooner
+const ANGULAR_DAMPING = 2.6; // higher = spin momentum stops sooner
+const VELOCITY_EPSILON = 0.02;
+// Safety clamp on release velocity — even a deliberate flick shouldn't send an
+// object rocketing off screen, and this also caps damage from any stray spike.
+const MAX_LINEAR_VELOCITY = 6; // world units/sec
+const MAX_ANGULAR_VELOCITY = 12; // rad/sec
+
+// A hand disappearing from tracking briefly (motion blur, going just out of frame,
+// a momentary detection miss) shouldn't drop its hold outright — that's what was
+// causing objects to fly off or lose their spot. Only release after it's been
+// missing longer than this, and treat that as a lost grip (no momentum), not a throw.
+const LOST_TRACKING_GRACE = 0.35; // seconds
+
+// Exponential-smoothing rates (higher = snappier/less lag, lower = smoother/more lag).
+// Using a rate + dt (rather than a flat lerp factor) keeps the feel consistent
+// even if the camera's frame rate varies.
+const LANDMARK_SMOOTH_RATE = 14; // filters raw hand-tracking jitter
+const GRAB_POS_RATE = 16; // how tightly a held object follows its hand(s)
+const SCALE_RATE = 10; // zoom smoothing
+
+function smoothFactor(rate: number, dt: number): number {
+  return 1 - Math.exp(-rate * dt);
+}
+
+// ---------- Three.js scene ----------
 const renderer = new THREE.WebGLRenderer({ canvas: sceneCanvas, alpha: true, antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 
 const scene3 = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
-camera.position.set(0, 0, 6);
+camera.position.set(0, 0, 7);
 
 function resize() {
   const w = window.innerWidth;
@@ -43,79 +84,141 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 
-// ---------- Per-hand hologram state ----------
-interface HandHologram {
+// Converts a landmark's normalized position within the raw video frame into a
+// world-space point on the z=0 plane, using the camera's real projection (not a
+// hardcoded scale) — this is what makes a hologram visually line up with your hand.
+const posRaycaster = new THREE.Raycaster();
+const zPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+function landmarkToWorldPos(lm: Landmark): THREE.Vector3 {
+  // `object-fit: cover` scales the video to fill the window and crops whichever
+  // axis overflows, so normalized landmark coords (relative to the FULL video
+  // buffer) must first be remapped to the VISIBLE (post-crop) area.
+  const videoAspect = (video.videoWidth || 16) / (video.videoHeight || 9);
+  const containerAspect = window.innerWidth / window.innerHeight;
+  let vx = lm.x;
+  let vy = lm.y;
+  if (videoAspect > containerAspect) {
+    const visibleFrac = containerAspect / videoAspect;
+    const offset = (1 - visibleFrac) / 2;
+    vx = (lm.x - offset) / visibleFrac;
+  } else {
+    const visibleFrac = videoAspect / containerAspect;
+    const offset = (1 - visibleFrac) / 2;
+    vy = (lm.y - offset) / visibleFrac;
+  }
+
+  // Mirror X (the video is displayed mirrored) and convert to NDC (-1..1).
+  const ndcX = (1 - vx) * 2 - 1;
+  const ndcY = -(vy * 2 - 1);
+
+  posRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+  const hit = new THREE.Vector3();
+  posRaycaster.ray.intersectPlane(zPlane, hit);
+  return hit;
+}
+
+// ---------- Grid of hologram "parts" ----------
+interface HologramObject {
+  id: number;
   group: THREE.Group;
   material: THREE.MeshBasicMaterial;
   color: number;
-
-  present: boolean;
-  grabbing: boolean;
   homePos: THREE.Vector3;
 
-  // Hover (not grabbing): position/scale drift smoothly toward the hand.
-  targetPos: THREE.Vector3;
+  holders: number[]; // hand-track ids currently holding this object (0, 1, or 2 of them)
   targetScale: number;
 
-  // Grab (pinching): rotation and position are bound directly to the hand.
-  grabStartHandQuat: THREE.Quaternion | null;
-  grabStartObjQuat: THREE.Quaternion | null;
+  // Solo-hold reference frame (used while holders.length === 1).
+  soloGrabHandQuat: THREE.Quaternion | null;
+  soloGrabObjQuat: THREE.Quaternion | null;
   prevHandQuat: THREE.Quaternion | null;
   prevPos: THREE.Vector3 | null;
 
-  // Momentum carried after release, decays over time (the "flick"/"spin" feel).
-  angularVelocity: THREE.Vector3; // axis * radians/sec
+  // Joint-hold reference frame (used while holders.length === 2, for the "combine" gesture).
+  jointStartCombinedQuat: THREE.Quaternion | null;
+  jointStartObjQuat: THREE.Quaternion | null;
+  jointStartHandDist: number | null;
+  jointStartObjScale: number | null;
+
+  // Momentum carried after a solo release, decays over time (the "flick"/"spin" feel).
+  angularVelocity: THREE.Vector3;
   linearVelocity: THREE.Vector3;
 }
 
-function createHologram(color: number, homeX: number): HandHologram {
+function createHologramObject(id: number, color: number, homePos: THREE.Vector3): HologramObject {
   const group = new THREE.Group();
-  const homePos = new THREE.Vector3(homeX, 0, 0);
   group.position.copy(homePos);
   scene3.add(group);
 
-  const geometry = new THREE.IcosahedronGeometry(1, 1);
-  const material = new THREE.MeshBasicMaterial({
-    color,
-    wireframe: true,
-    transparent: true,
-    opacity: 0.25,
-  });
+  const geometry = new THREE.IcosahedronGeometry(0.85, 1);
+  const material = new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.35 });
   group.add(new THREE.Mesh(geometry, material));
 
-  const coreGeometry = new THREE.IcosahedronGeometry(1, 1);
+  const coreGeometry = new THREE.IcosahedronGeometry(0.85, 1);
   const coreMaterial = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.08 });
   group.add(new THREE.Mesh(coreGeometry, coreMaterial));
 
   return {
+    id,
     group,
     material,
     color,
-    present: false,
-    grabbing: false,
-    homePos,
-    targetPos: homePos.clone(),
+    homePos: homePos.clone(),
+    holders: [],
     targetScale: 1,
-    grabStartHandQuat: null,
-    grabStartObjQuat: null,
+    soloGrabHandQuat: null,
+    soloGrabObjQuat: null,
     prevHandQuat: null,
     prevPos: null,
+    jointStartCombinedQuat: null,
+    jointStartObjQuat: null,
+    jointStartHandDist: null,
+    jointStartObjScale: null,
     angularVelocity: new THREE.Vector3(),
     linearVelocity: new THREE.Vector3(),
   };
 }
 
-const holograms: HandHologram[] = [
-  createHologram(HAND_COLORS[0], -1.8),
-  createHologram(HAND_COLORS[1], 1.8),
+// 2x2 grid of independent objects laid out on the "field" in front of the camera.
+const GRID_POSITIONS = [
+  new THREE.Vector3(-1.9, 1.1, 0),
+  new THREE.Vector3(1.9, 1.1, 0),
+  new THREE.Vector3(-1.9, -1.1, 0),
+  new THREE.Vector3(1.9, -1.1, 0),
 ];
+const objects: HologramObject[] = GRID_POSITIONS.map((pos, i) =>
+  createHologramObject(i, OBJECT_COLORS[i % OBJECT_COLORS.length], pos)
+);
 
-const PINCH_ON = 0.045; // normalized thumb-index distance below which a grab starts
-const PINCH_OFF = 0.065; // above which a grab releases (hysteresis avoids flicker at the edge)
-const AMBIENT_SPIN = 0.15; // rad/s idle rotation when nothing is grabbing
-const LINEAR_DAMPING = 2.2; // higher = fling stops sooner
-const ANGULAR_DAMPING = 2.6; // higher = spin momentum stops sooner
-const VELOCITY_EPSILON = 0.02;
+// ---------- Per-hand tracking ----------
+interface HandTrack {
+  id: number;
+  present: boolean;
+  pinching: boolean;
+  heldObjectId: number | null;
+  smoothedHandPos: THREE.Vector3 | null;
+  smoothedPalmWidth: number | null;
+  smoothedQuat: THREE.Quaternion | null;
+  lastPinchRatio: number | null; // for the debug HUD
+  missingTime: number; // seconds since this track was last actually seen
+}
+
+function createHandTrack(id: number): HandTrack {
+  return {
+    id,
+    present: false,
+    pinching: false,
+    heldObjectId: null,
+    smoothedHandPos: null,
+    smoothedPalmWidth: null,
+    smoothedQuat: null,
+    lastPinchRatio: null,
+    missingTime: 0,
+  };
+}
+
+const handTracks: HandTrack[] = [createHandTrack(0), createHandTrack(1)];
 
 // A vector from landmark `a` to landmark `b`, converted into the mirrored,
 // Y-up world space the scene uses (video is mirrored and image Y points down).
@@ -123,8 +226,12 @@ function worldDelta(a: Landmark, b: Landmark): THREE.Vector3 {
   return new THREE.Vector3(-(b.x - a.x), -(b.y - a.y), -(b.z - a.z));
 }
 
+function rawWristWorldPos(lm: HandLandmarks): THREE.Vector3 {
+  return landmarkToWorldPos(lm[0]);
+}
+
 // Builds an orientation quaternion for the hand from its palm landmarks, so
-// "grabbing" the hologram and turning your wrist turns the hologram the same way.
+// "grabbing" an object and turning your wrist turns the object the same way.
 function handOrientation(lm: HandLandmarks): THREE.Quaternion {
   const wrist = lm[0];
   const indexMcp = lm[5];
@@ -140,82 +247,274 @@ function handOrientation(lm: HandLandmarks): THREE.Quaternion {
   return new THREE.Quaternion().setFromRotationMatrix(m);
 }
 
-function updateHologramFromHand(h: HandHologram, lm: HandLandmarks, dt: number) {
-  h.present = true;
-  const wrist = lm[0];
+// Matches this frame's raw detections to the persistent hand tracks by nearest
+// wrist position, so a track's identity (and whatever it's holding) stays stable
+// even though MediaPipe's own array ordering can flip between hands frame to frame.
+function assignHandTracks(rawHands: HandLandmarks[]): (HandLandmarks | null)[] {
+  const assignment: (HandLandmarks | null)[] = [null, null];
+  if (rawHands.length === 0) return assignment;
+
+  const rawPos = rawHands.map(rawWristWorldPos);
+
+  if (rawHands.length === 1) {
+    let best = 0;
+    let bestDist = Infinity;
+    for (const track of handTracks) {
+      const d = track.smoothedHandPos ? track.smoothedHandPos.distanceTo(rawPos[0]) : Infinity;
+      if (d < bestDist) {
+        bestDist = d;
+        best = track.id;
+      }
+    }
+    assignment[best] = rawHands[0];
+    return assignment;
+  }
+
+  // Two raw hands, two tracks: pick whichever pairing minimizes total movement.
+  const d00 = handTracks[0].smoothedHandPos?.distanceTo(rawPos[0]) ?? 999;
+  const d11 = handTracks[1].smoothedHandPos?.distanceTo(rawPos[1]) ?? 999;
+  const d01 = handTracks[0].smoothedHandPos?.distanceTo(rawPos[1]) ?? 999;
+  const d10 = handTracks[1].smoothedHandPos?.distanceTo(rawPos[0]) ?? 999;
+
+  if (d00 + d11 <= d01 + d10) {
+    assignment[0] = rawHands[0];
+    assignment[1] = rawHands[1];
+  } else {
+    assignment[0] = rawHands[1];
+    assignment[1] = rawHands[0];
+  }
+  return assignment;
+}
+
+function updateHandTrack(track: HandTrack, lm: HandLandmarks, dt: number) {
+  track.present = true;
   const thumbTip = lm[4];
   const indexTip = lm[8];
   const indexMcp = lm[5];
   const pinkyMcp = lm[17];
 
-  // Hand position in world space, used both for hover-follow and as the grab anchor.
-  const nx = (1 - wrist.x) * 2 - 1;
-  const ny = -(wrist.y * 2 - 1);
-  const handPos = new THREE.Vector3(nx * 3, ny * 2, 0);
-  h.targetPos.copy(handPos);
+  const rawHandPos = rawWristWorldPos(lm);
+  const rawPalmWidth = Math.hypot(indexMcp.x - pinkyMcp.x, indexMcp.y - pinkyMcp.y, indexMcp.z - pinkyMcp.z);
+  const rawQuat = handOrientation(lm);
 
-  // Palm width is a stable proxy for hand distance from the camera (bigger = closer),
-  // so reaching toward the screen zooms in, like inspecting a prototype up close.
-  const palmWidth = Math.hypot(indexMcp.x - pinkyMcp.x, indexMcp.y - pinkyMcp.y, indexMcp.z - pinkyMcp.z);
-  h.targetScale = THREE.MathUtils.clamp(THREE.MathUtils.mapLinear(palmWidth, 0.07, 0.22, 0.5, 2.6), 0.5, 2.6);
+  const lmFactor = smoothFactor(LANDMARK_SMOOTH_RATE, dt);
+  if (!track.smoothedHandPos) track.smoothedHandPos = rawHandPos.clone();
+  else track.smoothedHandPos.lerp(rawHandPos, lmFactor);
+
+  track.smoothedPalmWidth =
+    track.smoothedPalmWidth === null ? rawPalmWidth : THREE.MathUtils.lerp(track.smoothedPalmWidth, rawPalmWidth, lmFactor);
+
+  if (!track.smoothedQuat) track.smoothedQuat = rawQuat.clone();
+  else track.smoothedQuat.slerp(rawQuat, lmFactor);
 
   const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y, thumbTip.z - indexTip.z);
-  const threshold = h.grabbing ? PINCH_OFF : PINCH_ON;
-  const shouldGrab = pinchDist < threshold;
+  const pinchRatio = pinchDist / (track.smoothedPalmWidth || rawPalmWidth || 1e-4);
+  track.lastPinchRatio = pinchRatio;
+  const threshold = track.pinching ? PINCH_OFF_RATIO : PINCH_ON_RATIO;
+  track.pinching = pinchRatio < threshold;
+}
 
-  if (shouldGrab && !h.grabbing) {
-    // Pinch just started: lock in the reference orientation/position to grab from.
-    h.grabbing = true;
-    h.grabStartHandQuat = handOrientation(lm);
-    h.grabStartObjQuat = h.group.quaternion.clone();
-    h.prevHandQuat = h.grabStartHandQuat.clone();
-    h.prevPos = h.group.position.clone();
-    h.angularVelocity.set(0, 0, 0);
-    h.linearVelocity.set(0, 0, 0);
-  } else if (!shouldGrab && h.grabbing) {
-    // Released: whatever rotational/linear velocity we had carries on and decays.
-    h.grabbing = false;
-    h.grabStartHandQuat = null;
-    h.grabStartObjQuat = null;
-    h.prevHandQuat = null;
-    h.prevPos = null;
+// Finds the object this (already-pinching) hand should claim or join. Each object
+// gets its own eligible radius (joining an object your other hand already holds
+// can reach a bit further than claiming a fresh idle one), but candidates are
+// compared by ACTUAL distance across both categories — whichever object is
+// genuinely closest wins. Previously "joinable" objects were checked first as a
+// category, so an idle object you were clearly hovering over could lose out to a
+// held object that was merely "in range" but farther away.
+function findClaimableObject(track: HandTrack): HologramObject | null {
+  if (!track.smoothedHandPos) return null;
+
+  let best: HologramObject | null = null;
+  let bestDist = Infinity;
+  for (const obj of objects) {
+    const isJoinable = obj.holders.length === 1 && !obj.holders.includes(track.id);
+    const isFree = obj.holders.length === 0;
+    if (!isJoinable && !isFree) continue;
+
+    const radius = isJoinable ? COMBINE_RADIUS : FREE_GRAB_RADIUS;
+    const d = obj.group.position.distanceTo(track.smoothedHandPos);
+    if (d < radius && d < bestDist) {
+      bestDist = d;
+      best = obj;
+    }
+  }
+  return best;
+}
+
+function releaseHold(track: HandTrack, keepMomentum: boolean) {
+  if (track.heldObjectId === null) return;
+  const obj = objects.find((o) => o.id === track.heldObjectId);
+  track.heldObjectId = null;
+  if (!obj) return;
+  obj.holders = obj.holders.filter((id) => id !== track.id);
+
+  if (!keepMomentum && obj.holders.length === 0) {
+    // Lost tracking, not a deliberate throw: freeze in place instead of flinging.
+    obj.linearVelocity.set(0, 0, 0);
+    obj.angularVelocity.set(0, 0, 0);
   }
 
-  if (h.grabbing && h.grabStartHandQuat && h.grabStartObjQuat) {
-    const currentHandQuat = handOrientation(lm);
-
-    // Rotation follows the hand 1:1 relative to where the grab started.
-    const deltaQuat = currentHandQuat.clone().multiply(h.grabStartHandQuat.clone().invert());
-    h.group.quaternion.copy(deltaQuat.multiply(h.grabStartObjQuat));
-
-    // Position is dragged directly by the hand while grabbing.
-    h.group.position.lerp(handPos, 0.6);
-
-    if (dt > 0 && h.prevHandQuat) {
-      // Track angular velocity (axis-angle/sec) from frame-to-frame rotation, so a
-      // fast twist right before release keeps spinning ("flicking") the hologram.
-      const frameDelta = currentHandQuat.clone().multiply(h.prevHandQuat.clone().invert());
-      const angle = 2 * Math.acos(THREE.MathUtils.clamp(frameDelta.w, -1, 1));
-      if (angle > 1e-4) {
-        const s = Math.sqrt(1 - frameDelta.w * frameDelta.w) || 1;
-        const axis = new THREE.Vector3(frameDelta.x / s, frameDelta.y / s, frameDelta.z / s);
-        h.angularVelocity.copy(axis.multiplyScalar(angle / dt));
-      } else {
-        h.angularVelocity.set(0, 0, 0);
-      }
+  if (obj.holders.length === 1) {
+    // Was joint, now back to solo: start a fresh solo reference frame so there's no pop.
+    const remaining = handTracks.find((t) => t.id === obj.holders[0]);
+    if (remaining && remaining.smoothedQuat) {
+      obj.soloGrabHandQuat = remaining.smoothedQuat.clone();
+      obj.soloGrabObjQuat = obj.group.quaternion.clone();
+      obj.prevHandQuat = obj.soloGrabHandQuat.clone();
+      obj.prevPos = obj.group.position.clone();
     }
-    if (dt > 0 && h.prevPos) {
-      h.linearVelocity.copy(h.group.position.clone().sub(h.prevPos).divideScalar(dt));
-    }
-    h.prevHandQuat = currentHandQuat;
-    h.prevPos = h.group.position.clone();
+    obj.jointStartCombinedQuat = null;
+    obj.jointStartObjQuat = null;
+    obj.jointStartHandDist = null;
+    obj.jointStartObjScale = null;
+  } else if (obj.holders.length === 0) {
+    // Fully released: momentum (captured just before this) carries it, then it settles in place.
+    obj.soloGrabHandQuat = null;
+    obj.soloGrabObjQuat = null;
+    obj.prevHandQuat = null;
+    obj.prevPos = null;
   }
 }
 
-function drawSkeleton(result: HandLandmarkerResult, grabbing: boolean[]) {
+function claimHold(track: HandTrack, obj: HologramObject) {
+  track.heldObjectId = obj.id;
+  obj.holders.push(track.id);
+  obj.angularVelocity.set(0, 0, 0);
+  obj.linearVelocity.set(0, 0, 0);
+
+  if (obj.holders.length === 1 && track.smoothedQuat) {
+    obj.soloGrabHandQuat = track.smoothedQuat.clone();
+    obj.soloGrabObjQuat = obj.group.quaternion.clone();
+    obj.prevHandQuat = obj.soloGrabHandQuat.clone();
+    obj.prevPos = obj.group.position.clone();
+  } else if (obj.holders.length === 2) {
+    const [aId, bId] = obj.holders;
+    const a = handTracks.find((t) => t.id === aId);
+    const b = handTracks.find((t) => t.id === bId);
+    if (a?.smoothedQuat && b?.smoothedQuat && a.smoothedHandPos && b.smoothedHandPos) {
+      obj.jointStartCombinedQuat = a.smoothedQuat.clone().slerp(b.smoothedQuat, 0.5);
+      obj.jointStartObjQuat = obj.group.quaternion.clone();
+      obj.jointStartHandDist = a.smoothedHandPos.distanceTo(b.smoothedHandPos);
+      obj.jointStartObjScale = obj.group.scale.x;
+    }
+  }
+}
+
+function updateGrabsAndHolds(dt: number) {
+  // Resolve grab/release transitions first.
+  for (const track of handTracks) {
+    if (!track.present) {
+      track.missingTime += dt;
+      // Brief tracking loss (motion blur, a frame the detector missed) doesn't drop
+      // the hold — the object just stays exactly where it was. Only a hand that's
+      // truly gone for a while releases, and without any fling (it wasn't a throw).
+      if (track.heldObjectId !== null && track.missingTime > LOST_TRACKING_GRACE) {
+        releaseHold(track, false);
+      }
+      continue;
+    }
+    track.missingTime = 0;
+    const wantsHold = track.pinching;
+    if (wantsHold && track.heldObjectId === null) {
+      const target = findClaimableObject(track);
+      if (target) claimHold(track, target);
+    } else if (!wantsHold && track.heldObjectId !== null) {
+      releaseHold(track, true);
+    }
+  }
+
+  // Apply transforms for currently-held objects.
+  for (const obj of objects) {
+    if (obj.holders.length === 1) {
+      const track = handTracks.find((t) => t.id === obj.holders[0]);
+      if (!track?.smoothedQuat || !track.smoothedHandPos || !obj.soloGrabHandQuat || !obj.soloGrabObjQuat) continue;
+
+      const currentHandQuat = track.smoothedQuat;
+      const deltaQuat = currentHandQuat.clone().multiply(obj.soloGrabHandQuat.clone().invert());
+      obj.group.quaternion.copy(deltaQuat.multiply(obj.soloGrabObjQuat));
+      obj.group.position.lerp(track.smoothedHandPos, smoothFactor(GRAB_POS_RATE, dt));
+      obj.targetScale = THREE.MathUtils.clamp(
+        THREE.MathUtils.mapLinear(track.smoothedPalmWidth ?? 0.14, 0.07, 0.22, 0.5, 2.6),
+        0.5,
+        2.6
+      );
+
+      if (dt > 0 && obj.prevHandQuat) {
+        const frameDelta = currentHandQuat.clone().multiply(obj.prevHandQuat.clone().invert());
+        const angle = 2 * Math.acos(THREE.MathUtils.clamp(frameDelta.w, -1, 1));
+        if (angle > 1e-4) {
+          const s = Math.sqrt(1 - frameDelta.w * frameDelta.w) || 1;
+          const axis = new THREE.Vector3(frameDelta.x / s, frameDelta.y / s, frameDelta.z / s);
+          const speed = Math.min(angle / dt, MAX_ANGULAR_VELOCITY);
+          obj.angularVelocity.copy(axis.multiplyScalar(speed));
+        } else {
+          obj.angularVelocity.set(0, 0, 0);
+        }
+      }
+      if (dt > 0 && obj.prevPos) {
+        const vel = obj.group.position.clone().sub(obj.prevPos).divideScalar(dt);
+        if (vel.length() > MAX_LINEAR_VELOCITY) vel.setLength(MAX_LINEAR_VELOCITY);
+        obj.linearVelocity.copy(vel);
+      }
+      obj.prevHandQuat = currentHandQuat.clone();
+      obj.prevPos = obj.group.position.clone();
+    } else if (obj.holders.length === 2) {
+      const [aId, bId] = obj.holders;
+      const a = handTracks.find((t) => t.id === aId);
+      const b = handTracks.find((t) => t.id === bId);
+      if (!a?.smoothedQuat || !b?.smoothedQuat || !a.smoothedHandPos || !b.smoothedHandPos) continue;
+      if (!obj.jointStartCombinedQuat || !obj.jointStartObjQuat || !obj.jointStartHandDist || !obj.jointStartObjScale) continue;
+
+      // Rotation: the average of both hands' orientation, relative to where the joint grab started.
+      const currentCombinedQuat = a.smoothedQuat.clone().slerp(b.smoothedQuat, 0.5);
+      const deltaQuat = currentCombinedQuat.clone().multiply(obj.jointStartCombinedQuat.clone().invert());
+      obj.group.quaternion.copy(deltaQuat.multiply(obj.jointStartObjQuat));
+
+      // Position: the midpoint between both hands.
+      const midpoint = a.smoothedHandPos.clone().add(b.smoothedHandPos).multiplyScalar(0.5);
+      obj.group.position.lerp(midpoint, smoothFactor(GRAB_POS_RATE, dt));
+
+      // Scale: pull your hands apart to stretch it bigger, like inspecting a part up close.
+      const currentDist = a.smoothedHandPos.distanceTo(b.smoothedHandPos);
+      obj.targetScale = THREE.MathUtils.clamp(
+        obj.jointStartObjScale * (currentDist / obj.jointStartHandDist),
+        0.4,
+        3.5
+      );
+    }
+  }
+}
+
+// Live readout of what the tracker actually sees, since pinch/grab tuning is
+// impossible to get right blind — this makes the raw numbers visible so the
+// PINCH_ON_RATIO / GRAB_RADIUS constants above can be tuned against reality.
+function updateDebugHud() {
+  const lines = handTracks.map((track) => {
+    if (!track.present) return `hand ${track.id}: not detected`;
+    const ratio = track.lastPinchRatio !== null ? track.lastPinchRatio.toFixed(2) : '?';
+    let nearestId = '-';
+    let nearestDist = Infinity;
+    if (track.smoothedHandPos) {
+      for (const obj of objects) {
+        const d = obj.group.position.distanceTo(track.smoothedHandPos);
+        if (d < nearestDist) {
+          nearestDist = d;
+          nearestId = String(obj.id);
+        }
+      }
+    }
+    const held = track.heldObjectId !== null ? `HOLDING #${track.heldObjectId}` : track.pinching ? 'pinching, nothing in range' : 'open';
+    return `hand ${track.id}: pinch ${ratio} (grab<${PINCH_ON_RATIO}) | nearest #${nearestId} @ ${nearestDist.toFixed(2)} (free<${FREE_GRAB_RADIUS} join<${COMBINE_RADIUS}) | ${held}`;
+  });
+  debugEl.textContent = lines.join('\n');
+}
+
+function drawSkeleton(rawHands: HandLandmarks[], trackByRawIndex: (HandTrack | null)[]) {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
-  result.landmarks.forEach((lm, i) => {
-    const color = grabbing[i] ? '255, 204, 51' : i === 0 ? '0, 229, 255' : '255, 90, 210';
+  rawHands.forEach((lm, i) => {
+    const track = trackByRawIndex[i];
+    const held = track && track.heldObjectId !== null;
+    const color = held ? '255, 204, 51' : track?.id === 1 ? '255, 90, 210' : '0, 229, 255';
     overlayCtx.strokeStyle = `rgba(${color}, 0.9)`;
     overlayCtx.lineWidth = 2;
     overlayCtx.beginPath();
@@ -242,43 +541,47 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.1);
 
-  for (const h of holograms) {
-    if (h.grabbing) {
-      // Rotation/position already applied directly in updateHologramFromHand.
-    } else if (h.present) {
-      // Hovering: drift smoothly toward the hand and idle-spin.
-      h.group.position.lerp(h.targetPos, 0.15);
-      h.group.rotateY(AMBIENT_SPIN * dt);
+  for (const obj of objects) {
+    if (obj.holders.length > 0) {
+      // Transform already applied in updateGrabsAndHolds.
     } else {
-      // No hand tracked: apply leftover momentum (the "flick"), then settle home.
-      const speed = h.linearVelocity.length() + h.angularVelocity.length();
+      // Not held: apply leftover momentum (the "flick"), then rest in place.
+      const speed = obj.linearVelocity.length() + obj.angularVelocity.length();
       if (speed > VELOCITY_EPSILON) {
-        h.group.position.addScaledVector(h.linearVelocity, dt);
-        const angle = h.angularVelocity.length() * dt;
+        obj.group.position.addScaledVector(obj.linearVelocity, dt);
+        const angle = obj.angularVelocity.length() * dt;
         if (angle > 1e-5) {
-          const axis = h.angularVelocity.clone().normalize();
-          h.group.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(axis, angle));
+          const axis = obj.angularVelocity.clone().normalize();
+          obj.group.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(axis, angle));
         }
-        const linearDecay = Math.exp(-LINEAR_DAMPING * dt);
-        const angularDecay = Math.exp(-ANGULAR_DAMPING * dt);
-        h.linearVelocity.multiplyScalar(linearDecay);
-        h.angularVelocity.multiplyScalar(angularDecay);
+        obj.linearVelocity.multiplyScalar(Math.exp(-LINEAR_DAMPING * dt));
+        obj.angularVelocity.multiplyScalar(Math.exp(-ANGULAR_DAMPING * dt));
       } else {
-        h.linearVelocity.set(0, 0, 0);
-        h.angularVelocity.set(0, 0, 0);
-        h.group.position.lerp(h.homePos, 0.05);
-        h.group.rotateY(AMBIENT_SPIN * dt);
-        h.targetScale = 1;
+        obj.linearVelocity.set(0, 0, 0);
+        obj.angularVelocity.set(0, 0, 0);
+        obj.group.rotateY(AMBIENT_SPIN * dt);
+        // targetScale is left as-is: a released object keeps whatever size you left it at.
       }
     }
 
-    const nextScale = THREE.MathUtils.lerp(h.group.scale.x, h.targetScale, 0.15);
-    h.group.scale.setScalar(nextScale);
+    const nextScale = THREE.MathUtils.lerp(obj.group.scale.x, obj.targetScale, smoothFactor(SCALE_RATE, dt));
+    obj.group.scale.setScalar(nextScale);
 
-    const targetColor = h.grabbing ? GRAB_COLOR : h.color;
-    h.material.color.lerp(new THREE.Color(targetColor), 0.2);
-    const targetOpacity = h.present || h.linearVelocity.length() + h.angularVelocity.length() > VELOCITY_EPSILON ? 0.85 : 0.2;
-    h.material.opacity = THREE.MathUtils.lerp(h.material.opacity, targetOpacity, 0.1);
+    // Nearest claimable object to any unheld, pinching-adjacent hand gets a hover hint.
+    const isHeld = obj.holders.length > 0;
+    let isHoverHint = false;
+    if (!isHeld) {
+      for (const track of handTracks) {
+        if (track.present && track.smoothedHandPos && track.heldObjectId === null) {
+          if (obj.group.position.distanceTo(track.smoothedHandPos) < FREE_GRAB_RADIUS) isHoverHint = true;
+        }
+      }
+    }
+
+    const targetColor = isHeld ? GRAB_COLOR : isHoverHint ? HOVER_HINT_COLOR : obj.color;
+    obj.material.color.lerp(new THREE.Color(targetColor), 0.2);
+    const targetOpacity = isHeld ? 0.9 : isHoverHint ? 0.55 : 0.3;
+    obj.material.opacity = THREE.MathUtils.lerp(obj.material.opacity, targetOpacity, 0.1);
   }
 
   renderer.render(scene3, camera);
@@ -298,6 +601,14 @@ async function setupHandTracking() {
     },
     runningMode: 'VIDEO',
     numHands: MAX_HANDS,
+    // Detection confidence (finding a hand-shaped region in the first place) needs
+    // to stay strict, or faces/beards/other skin-toned blobs get misread as hands.
+    // Presence/tracking confidence (staying locked onto a hand already found) can
+    // stay lower — that's what was needed for pinch occlusion, and doesn't cause
+    // false positives since it only applies to a region already confirmed as a hand.
+    minHandDetectionConfidence: 0.6,
+    minHandPresenceConfidence: 0.4,
+    minTrackingConfidence: 0.4,
   });
 
   statusEl.textContent = 'Requesting camera…';
@@ -312,7 +623,7 @@ async function setupHandTracking() {
   resize();
   animate();
 
-  statusEl.textContent = 'Pinch to grab & turn, drag to move, release to flick, reach in to zoom';
+  statusEl.textContent = 'Pinch near a part to grab it — both hands on the same part to combine it';
 
   let lastTime = -1;
   let lastDetectMs = performance.now();
@@ -322,26 +633,27 @@ async function setupHandTracking() {
       const now = performance.now();
       const dt = Math.min((now - lastDetectMs) / 1000, 0.1);
       lastDetectMs = now;
-      const result = handLandmarker.detectForVideo(video, now);
+      const result: HandLandmarkerResult = handLandmarker.detectForVideo(video, now);
+      const rawHands = result.landmarks as HandLandmarks[];
 
-      const grabbing: boolean[] = [];
-      for (let i = 0; i < holograms.length; i++) {
-        const lm = result.landmarks[i];
+      const assigned = assignHandTracks(rawHands);
+      const trackByRawIndex: (HandTrack | null)[] = rawHands.map(() => null);
+
+      for (const track of handTracks) {
+        const lm = assigned[track.id];
         if (lm) {
-          updateHologramFromHand(holograms[i], lm as HandLandmarks, dt);
+          updateHandTrack(track, lm, dt);
+          const rawIndex = rawHands.indexOf(lm);
+          if (rawIndex >= 0) trackByRawIndex[rawIndex] = track;
         } else {
-          holograms[i].present = false;
-          if (holograms[i].grabbing) {
-            holograms[i].grabbing = false;
-            holograms[i].grabStartHandQuat = null;
-            holograms[i].grabStartObjQuat = null;
-            holograms[i].prevHandQuat = null;
-            holograms[i].prevPos = null;
-          }
+          track.present = false;
+          track.pinching = false;
         }
-        grabbing.push(holograms[i].grabbing);
       }
-      drawSkeleton(result, grabbing);
+
+      updateGrabsAndHolds(dt);
+      drawSkeleton(rawHands, trackByRawIndex);
+      updateDebugHud();
     }
     requestAnimationFrame(detect);
   }
